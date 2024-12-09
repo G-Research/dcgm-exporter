@@ -21,6 +21,7 @@ import (
 	"github.com/urfave/cli/v2"
 
 	"github.com/NVIDIA/dcgm-exporter/pkg/dcgmexporter"
+	"github.com/NVIDIA/dcgm-exporter/pkg/dcgmexporter/podwatcher"
 	"github.com/NVIDIA/dcgm-exporter/pkg/stdout"
 )
 
@@ -30,8 +31,8 @@ const (
 	MinorKey               = "i" // Monitor sub-level entities: GPU instances/NvLinks/CPUCores - GPUI cannot be specified if MIG is disabled
 	undefinedConfigMapData = "none"
 	deviceUsageTemplate    = `Specify which devices dcgm-exporter monitors.
-	Possible values: {{.FlexKey}} or 
-	                 {{.MajorKey}}[:id1[,-id2...] or 
+	Possible values: {{.FlexKey}} or
+	                 {{.MajorKey}}[:id1[,-id2...] or
 	                 {{.MinorKey}}[:id1[,-id2...].
 	If an id list is used, then devices with match IDs must exist on the system. For example:
 		(default) = monitor all GPU instances in MIG mode, all GPUs if MIG mode is disabled. (See {{.FlexKey}})
@@ -75,6 +76,9 @@ const (
 	CLIPodResourcesKubeletSocket  = "pod-resources-kubelet-socket"
 	CLIHPCJobMappingDir           = "hpc-job-mapping-dir"
 	CLINvidiaResourceNames        = "nvidia-resource-names"
+	CLIOtelCollector              = "otel-collector"
+	CLIOtelInheritPodLabels       = "otel-inherit-pod-labels"
+	CLIOtelInheritPodAnnotations  = "otel-inherit-pod-annotations"
 )
 
 func NewApp(buildVersion ...string) *cli.App {
@@ -244,6 +248,24 @@ func NewApp(buildVersion ...string) *cli.App {
 			Usage:   "Nvidia resource names for specified GPU type like nvidia.com/a100, nvidia.com/a10.",
 			EnvVars: []string{"NVIDIA_RESOURCE_NAMES"},
 		},
+		&cli.StringFlag{
+			Name:    CLIOtelCollector,
+			Value:   "",
+			Usage:   "Address of the OpenTelemetry collector to send metrics to.",
+			EnvVars: []string{"DCGM_EXPORTER_OTEL_COLLECTOR"},
+		},
+		&cli.StringSliceFlag{
+			Name:    CLIOtelInheritPodLabels,
+			Value:   cli.NewStringSlice(),
+			Usage:   "List of pod labels to inherit from the pod observed.",
+			EnvVars: []string{"DCGM_EXPORTER_OTEL_INHERIT_POD_LABELS"},
+		},
+		&cli.StringSliceFlag{
+			Name:    CLIOtelInheritPodAnnotations,
+			Value:   cli.NewStringSlice(),
+			Usage:   "List of pod annotations to inherit from the pod observed.",
+			EnvVars: []string{"DCGM_EXPORTER_OTEL_INHERIT_POD_ANNOTATIONS"},
+		},
 	}
 
 	if runtime.GOOS == "linux" {
@@ -303,12 +325,21 @@ restart:
 	cleanupDCGM := initDCGM(config)
 	defer cleanupDCGM()
 
+	if config.OtelCollector != "" {
+		cleanupOtel, err := initOtel(c.Context, config)
+		if err != nil {
+			return err
+		}
+		defer cleanupOtel(context.Background())
+	}
+
 	logrus.Info("DCGM successfully initialized!")
 
 	dcgm.FieldsInit()
 	defer dcgm.FieldsTerm()
 
 	fillConfigMetricGroups(config)
+	fillOtelMeter(config)
 
 	cs := getCounters(config)
 
@@ -317,6 +348,19 @@ restart:
 	hostname, err := dcgmexporter.GetHostname(config)
 	if err != nil {
 		return err
+	}
+
+	if config.Kubernetes {
+		podWatcher, err := podwatcher.New()
+		if err != nil {
+			return err
+		}
+		go func() {
+			if err := podWatcher.Run(c.Context); err != nil {
+				logrus.Errorf("PodWatcher failed: %v", err)
+			}
+		}()
+		config.PodWatcher = podWatcher
 	}
 
 	pipeline, cleanup, err := dcgmexporter.NewMetricsPipeline(config,
@@ -639,5 +683,8 @@ func contextToConfig(c *cli.Context) (*dcgmexporter.Config, error) {
 		PodResourcesKubeletSocket:  c.String(CLIPodResourcesKubeletSocket),
 		HPCJobMappingDir:           c.String(CLIHPCJobMappingDir),
 		NvidiaResourceNames:        c.StringSlice(CLINvidiaResourceNames),
+		OtelCollector:              c.String(CLIOtelCollector),
+		OtelInheritPodLabels:       c.StringSlice(CLIOtelInheritPodLabels),
+		OtelInheritPodAnnotations:  c.StringSlice(CLIOtelInheritPodAnnotations),
 	}, nil
 }
